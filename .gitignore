@@ -3,3 +3,13 @@ __pycache__/
 .env
 .venv/
 logs/
+
+# Dados operacionais do PRD-002 (memória de longo prazo, sessões, OKFs, settings locais)
+memory/facts/
+knowledge/okf/
+sessions/
+settings.local.json
+
+# Cofre local de segredos (PRD-003) — nunca versionar
+secrets/
+*.tmp
