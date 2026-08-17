@@ -53,6 +53,7 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         "display_name": "Demonstração local",
         "executor_path": EXECUTORS_DIR / "local_demo.py",
         "allowed_origins": ["local-demo"],
+        "requires_secret_id": False,
         "capabilities": {
             "read_status": {
                 "kind": "read",
@@ -67,7 +68,27 @@ PROVIDERS: dict[str, dict[str, Any]] = {
                 "description": "Gera um resumo sintético local (sem envio externo).",
             },
         },
-    }
+    },
+    # PRD-005: primeiro provider real, por API oficial HTTPS, somente
+    # leitura. Host, caminho, método e capacidade pertencem só a este
+    # código — nunca a texto livre do usuário (PRD-005, seção 3.4).
+    "github": {
+        "display_name": "GitHub (API oficial, somente leitura)",
+        "executor_path": EXECUTORS_DIR / "github_read_repos.py",
+        "allowed_origins": ["https://api.github.com"],
+        "requires_secret_id": True,
+        "capabilities": {
+            "read_repositories": {
+                "kind": "read",
+                "requires_secret": True,
+                "schedulable": True,
+                "timeout_seconds": 120,
+                "description": (
+                    "Lista até 20 repositórios pessoais (GET /user/repos), somente leitura, sem efeito externo."
+                ),
+            },
+        },
+    },
 }
 
 
@@ -136,14 +157,21 @@ def _validate_connector(data: Any) -> dict[str, Any]:
     if unknown:
         raise ConnectorCorruptedError(f"registro de conector com capacidades desconhecidas: {unknown!r}")
 
+    # `secret_id` segue exatamente o que o provider declara (PRD-005, seção
+    # 5.1): providers que exigem credencial não podem ter o campo ausente, e
+    # providers que não usam credencial (ex.: local-demo) não podem ter um
+    # secret_id "sobrando" — um registro adulterado com qualquer uma dessas
+    # divergências é corrompido, não só "estranho".
     secret_id = data.get("secret_id")
-    if secret_id is not None:
-        if not isinstance(secret_id, str):
-            raise ConnectorCorruptedError("registro de conector com secret_id inválido")
+    if provider.get("requires_secret_id"):
+        if not isinstance(secret_id, str) or not secret_id:
+            raise ConnectorCorruptedError("registro de conector deste provider exige 'secret_id' válido")
         try:
             ids.validate_id(secret_id)
         except ids.InvalidIdError as exc:
             raise ConnectorCorruptedError("registro de conector com secret_id malformado") from exc
+    elif secret_id is not None:
+        raise ConnectorCorruptedError("registro de conector deste provider não deve ter 'secret_id'")
 
     origins = data.get("allowed_origins")
     if not isinstance(origins, list) or not origins or not all(isinstance(o, str) for o in origins):
@@ -181,6 +209,43 @@ def create_demo(display_name: str) -> dict[str, Any]:
         "enabled": True,
         "capabilities": sorted(provider["capabilities"].keys()),
         "secret_id": None,
+        "allowed_origins": list(provider["allowed_origins"]),
+        "schedule": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _save(record)
+    return record
+
+
+def create(provider_name: str, secret_id: str | None) -> dict[str, Any]:
+    """Cria um conector para um provider real que exige credencial do cofre
+    (PRD-005, seção 5.1) — ex.: `github`. `secret_id` só é validado quanto
+    ao formato aqui; confirmar que a entrada existe de fato no cofre é
+    responsabilidade do chamador (CLI), que já precisa falar com o cofre
+    para isso e evita este módulo depender de `core.vault` (mesmo espírito
+    de `scheduler.delete_for_connector` evitando import circular)."""
+    provider = PROVIDERS.get(provider_name)
+    if provider is None:
+        raise ConnectorError(f"provider desconhecido: {provider_name!r}")
+
+    if provider.get("requires_secret_id"):
+        if not secret_id:
+            raise ConnectorError("este provider exige um secret_id do cofre (--secret-id)")
+        ids.validate_id(secret_id)
+    elif secret_id is not None:
+        raise ConnectorError("este provider não usa credencial do cofre")
+
+    connector_id = ids.new_id("conn")
+    now = _now()
+    record: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "id": connector_id,
+        "provider": provider_name,
+        "display_name": provider["display_name"],
+        "enabled": True,
+        "capabilities": sorted(provider["capabilities"].keys()),
+        "secret_id": secret_id,
         "allowed_origins": list(provider["allowed_origins"]),
         "schedule": None,
         "created_at": now,

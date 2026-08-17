@@ -598,3 +598,34 @@ def delete_secret(entry_id: str) -> bool:
 def audit_log() -> list[dict[str, Any]]:
     unlocked = _unlock()
     return list(unlocked.payload["audit"])
+
+
+def with_secret(secret_id: str, callback: Any) -> Any:
+    """API interna mínima, não exposta pela CLI (PRD-005, seção 5.2): usada
+    só por um executor autorizado (`executors/*.py`) para usar uma
+    credencial pelo ID. Desbloqueia o cofre no próprio processo que precisa
+    da credencial, fornece o valor apenas a `callback(value)` e descarta a
+    referência ao final. O retorno de `callback` deve ser um resultado
+    seguro (ex.: um resumo já redigido) — nunca o valor do segredo. Qualquer
+    exceção do callback vira VaultError com mensagem fixa, nunca `str(exc)`
+    do chamador, para não arriscar vazar o segredo numa mensagem de erro
+    montada fora do cofre."""
+    ids.validate_id(secret_id)
+    unlocked = _unlock()
+    entry = next((e for e in unlocked.payload["entries"] if e["id"] == secret_id), None)
+    if entry is None:
+        raise VaultError("credencial não encontrada no cofre")
+
+    value = entry["value"]
+    try:
+        result = callback(value)
+    except Exception as exc:
+        raise VaultError("uso da credencial falhou") from exc
+    finally:
+        value = None
+
+    now = _now()
+    entry["last_used_at"] = now
+    unlocked.payload["audit"].append({"at": now, "action": "secret_use", "entry_id": secret_id, "result": "ok"})
+    _save_locked(unlocked)
+    return result

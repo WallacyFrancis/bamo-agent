@@ -29,6 +29,11 @@ SCHEMA_VERSION = 1
 # prática, um laço sem controle de taxa.
 MIN_INTERVAL_MINUTES = 5
 
+# Provider real com credencial (PRD-005, seção 12, decisão 3): intervalo
+# mínimo maior que o núcleo genérico, para reduzir rate limit e impacto de
+# erro em cada disparo de uma capacidade que de fato sai para a rede.
+REAL_PROVIDER_MIN_INTERVAL_MINUTES = 15
+
 LOCK_PATH = SCHEDULES_DIR / ".scheduler.lock"
 
 
@@ -98,6 +103,22 @@ def _parse_dt(value: Any) -> datetime:
     return dt
 
 
+def _min_interval_for(cap_def: dict[str, Any]) -> int:
+    return REAL_PROVIDER_MIN_INTERVAL_MINUTES if cap_def.get("requires_secret") else MIN_INTERVAL_MINUTES
+
+
+def _has_successful_manual_run(connector_id: str, capability: str) -> bool:
+    """PRD-005, seção 6: uma capacidade que usa credencial só pode ser
+    agendada depois de pelo menos uma execução manual bem-sucedida daquela
+    mesma capacidade, já validada pelo usuário via `connector run
+    --confirm`. Evita que uma agenda dispare, sem supervisão, contra um
+    token nunca antes testado."""
+    for event in connector_audit.list_events(connector_id):
+        if event.get("capability") == capability and event.get("origin") == "manual" and event.get("ok") is True:
+            return True
+    return False
+
+
 def _validate_schedule(data: Any) -> dict[str, Any]:
     """Espelha `_validate_connector`/`_validate_envelope`: um
     `schedule-*.json` sintaticamente válido mas estruturalmente errado
@@ -142,6 +163,8 @@ def _validate_schedule(data: Any) -> dict[str, Any]:
     capability = data["capability"]
     if capability not in provider["capabilities"] or capability not in connector["capabilities"]:
         raise SchedulerError(f"registro de agenda com capacidade inválida para o conector referenciado: {capability!r}")
+    cap_def = provider["capabilities"][capability]
+    min_interval = _min_interval_for(cap_def)
 
     for field in _DATE_FIELDS:
         try:
@@ -151,7 +174,7 @@ def _validate_schedule(data: Any) -> dict[str, Any]:
     if not isinstance(data.get("enabled"), bool):
         raise SchedulerError("registro de agenda com 'enabled' ausente ou inválido")
     every = data.get("every_minutes")
-    if not isinstance(every, int) or isinstance(every, bool) or every < MIN_INTERVAL_MINUTES:
+    if not isinstance(every, int) or isinstance(every, bool) or every < min_interval:
         raise SchedulerError("registro de agenda com 'every_minutes' ausente ou inválido")
     last_run_at = data.get("last_run_at")
     if last_run_at is not None:
@@ -209,8 +232,17 @@ def set_schedule(connector_id: str, capability: str, every_minutes: int) -> dict
     if cap_def["kind"] not in ("read", "notify") or not cap_def.get("schedulable"):
         raise NotSchedulableError(f"capacidade não agendável (efeito de escrita ou não idempotente): {capability!r}")
 
-    if not isinstance(every_minutes, int) or isinstance(every_minutes, bool) or every_minutes < MIN_INTERVAL_MINUTES:
-        raise InvalidIntervalError(f"intervalo mínimo aprovado é {MIN_INTERVAL_MINUTES} minutos")
+    # Provider real com credencial (PRD-005, seção 6): exige ao menos uma
+    # execução manual bem-sucedida já registrada na auditoria antes de
+    # aceitar qualquer agenda para esta capacidade.
+    if cap_def.get("requires_secret") and not _has_successful_manual_run(connector_id, capability):
+        raise NotSchedulableError(
+            f"capacidade {capability!r} exige uma execução manual bem-sucedida (connector run --confirm) antes de agendar"
+        )
+
+    min_interval = _min_interval_for(cap_def)
+    if not isinstance(every_minutes, int) or isinstance(every_minutes, bool) or every_minutes < min_interval:
+        raise InvalidIntervalError(f"intervalo mínimo aprovado para esta capacidade é {min_interval} minutos")
 
     for existing in list_all():
         if existing["connector_id"] == connector_id and existing["capability"] == capability and existing["enabled"]:

@@ -16,6 +16,7 @@ from core import (
     connectors,
     context_builder,
     dispatcher,
+    ids,
     knowledge_store,
     learning,
     memory_store,
@@ -442,6 +443,52 @@ def cmd_connector_create_demo(name: str) -> int:
     return 0
 
 
+def cmd_connector_create(provider_name: str, secret_id: str | None, confirm: str | None) -> int:
+    provider = connectors.PROVIDERS.get(provider_name)
+    if provider is None:
+        print(f"Erro: provider desconhecido: {provider_name}", file=sys.stderr)
+        return 2
+    if not provider.get("requires_secret_id"):
+        print(
+            f"Erro: provider {provider_name!r} não usa credencial do cofre "
+            "— use 'bamo connector create-demo' para providers de demonstração.",
+            file=sys.stderr,
+        )
+        return 2
+    if not secret_id:
+        print("Erro: este provider exige --secret-id <sec-id>.", file=sys.stderr)
+        return 2
+    ids.validate_id(secret_id)
+
+    try:
+        vault_secret_ids = {entry["id"] for entry in vault.list_secrets()}
+    except vault.VaultError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    if secret_id not in vault_secret_ids:
+        print(f"Erro: secret_id não encontrado no cofre: {secret_id}", file=sys.stderr)
+        return 1
+
+    if confirm != secret_id:
+        print(f"Provider: {provider_name} ({provider['display_name']})")
+        print(f"Host autorizado: {', '.join(provider['allowed_origins'])}")
+        print(f"Capacidades: {', '.join(sorted(provider['capabilities'].keys()))}")
+        print(f"Credencial (secret_id): {secret_id}")
+        print(
+            f"Para confirmar, rode: bamo connector create {provider_name} "
+            f"--secret-id {secret_id} --confirm {secret_id}"
+        )
+        return 2
+
+    try:
+        record = connectors.create(provider_name, secret_id)
+    except connectors.ConnectorError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    print(f"Conector criado: {record['id']} ({record['display_name']}, provider={record['provider']})")
+    return 0
+
+
 def cmd_connector_enable(connector_id: str, confirm: str | None) -> int:
     if confirm != connector_id:
         print(f"Alvo: {connector_id}")
@@ -466,7 +513,11 @@ def cmd_connector_disable(connector_id: str, confirm: str | None) -> int:
     except connectors.ConnectorError as exc:
         print(f"Erro: {exc}", file=sys.stderr)
         return 1
-    print(f"Conector desabilitado: {connector_id}")
+    # PRD-005, seção 9: desabilitar cancela agendas associadas, igual à
+    # exclusão — evita deixar uma agenda "habilitada" apontando para um
+    # conector que não pode mais executar nada até ser reabilitado.
+    removed_schedules = scheduler.delete_for_connector(connector_id)
+    print(f"Conector desabilitado: {connector_id} ({removed_schedules} agenda(s) associada(s) removida(s))")
     return 0
 
 
@@ -716,6 +767,13 @@ def build_parser() -> argparse.ArgumentParser:
     c_create = connector_sub.add_parser("create-demo", help="cria o conector de demonstração local-demo")
     c_create.add_argument("nome")
 
+    c_create_real = connector_sub.add_parser(
+        "create", help="cria um conector para um provider real com credencial do cofre (exige --secret-id e --confirm)"
+    )
+    c_create_real.add_argument("provider")
+    c_create_real.add_argument("--secret-id", default=None, dest="secret_id")
+    c_create_real.add_argument("--confirm", default=None)
+
     c_enable = connector_sub.add_parser("enable", help="habilita um conector (exige --confirm)")
     c_enable.add_argument("id")
     c_enable.add_argument("--confirm", default=None)
@@ -821,6 +879,8 @@ def main() -> int:
                 return cmd_connector_show(args.id)
             if args.connector_command == "create-demo":
                 return cmd_connector_create_demo(args.nome)
+            if args.connector_command == "create":
+                return cmd_connector_create(args.provider, args.secret_id, args.confirm)
             if args.connector_command == "enable":
                 return cmd_connector_enable(args.id, args.confirm)
             if args.connector_command == "disable":

@@ -80,6 +80,7 @@ alvo, como os demais comandos destrutivos.
 python3 bamo.py connector list
 python3 bamo.py connector show <connector-id>
 python3 bamo.py connector create-demo <nome>
+python3 bamo.py connector create <provider> --secret-id <sec-id> --confirm <sec-id>
 python3 bamo.py connector enable <connector-id> --confirm <connector-id>
 python3 bamo.py connector disable <connector-id> --confirm <connector-id>
 python3 bamo.py connector delete <connector-id> --confirm <connector-id>
@@ -98,9 +99,14 @@ Um conector (`connectors/<id>.json`) declara um `provider` e uma lista
 fechada de `capabilities`, ambos validados contra uma allowlist implementada
 em código (`core/connectors.py`) — nunca texto livre do usuário. `agy`,
 `chat` e `ask` nunca criam, alteram nem executam conector algum; só a CLI
-explícita faz isso. `create-demo` cria o único provider desta fase,
+explícita faz isso. `create-demo` cria o provider de demonstração
 `local-demo`, que opera exclusivamente sobre dados sintéticos gerados em
-memória — sem rede, sem navegador, sem credencial real.
+memória — sem rede, sem navegador, sem credencial real. `create` cria um
+conector para um provider real que usa credencial do cofre (só `github`
+nesta fase) — recebe apenas o `secret_id` (nunca rótulo ou valor), confirma
+que a entrada existe no cofre, mostra provider/host/capacidades/secret_id e
+exige confirmação literal do `secret_id` antes de gravar; a criação não
+desbloqueia nem testa o token, só grava a referência.
 
 `connector run` mostra o conector, a capacidade e seu efeito antes de pedir
 confirmação; a confirmação é o ID exato do conector e vale só para aquela
@@ -116,9 +122,46 @@ conector, recusa intervalos abaixo do mínimo aprovado e agendas duplicadas.
 `bamo scheduler run` processa as agendas devidas numa única execução, sob
 lock que impede sobreposição — pensado para ser chamado pelo cron do
 sistema (ex.: `*/5 * * * * cd /caminho/do/projeto && python3 bamo.py
-scheduler run`); o Bamo nunca instala nem edita crontab sozinho. Nenhuma
-capacidade deste PRD usa credencial do cofre — `secret_id` existe no schema
-do conector como referência reservada para um provider futuro.
+scheduler run`); o Bamo nunca instala nem edita crontab sozinho. Desabilitar
+ou apagar um conector cancela as agendas associadas.
+
+#### Provider real: GitHub (somente leitura)
+
+O provider `github` (PRD-005) usa a API REST oficial (`GET /user/repos`),
+somente leitura, com uma credencial do cofre. Nenhum endpoint de escrita
+existe no provider ou no executor — comentar, curtir, seguir, publicar ou
+alterar qualquer configuração externa está fora de escopo.
+
+1. Crie um **fine-grained personal access token** em
+   `github.com` → Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens. Restrinja a "Only select repositories" (ou a um
+   repositório descartável de teste) e conceda só a permissão de leitura
+   *Contents* (ou *Metadata*, conforme o escopo mínimo que o GitHub exigir
+   para listar repositórios) — nunca permissões de escrita, nunca acesso a
+   todos os repositórios sem necessidade.
+2. Guarde o token no cofre: `bamo secret set <rótulo>` (ou `--stdin`) — o
+   Bamo nunca vê nem pede o token por outro caminho.
+3. Crie o conector: `bamo connector create github --secret-id <sec-id>
+   --confirm <sec-id>`. O `secret_id` deve existir no cofre; o valor do
+   token nunca aparece em tela, log ou argumento.
+4. Rode `bamo connector run <conn-id> read_repositories --confirm <conn-id>`
+   para validar manualmente antes de agendar. Só depois de uma execução
+   manual bem-sucedida (registrada na auditoria) o `schedule set` aceita
+   agendar essa capacidade, com intervalo mínimo de 15 minutos.
+5. Para revogar o acesso, apague o token diretamente em
+   `github.com` → Settings → Developer settings → Personal access tokens
+   (o Bamo não revoga credenciais no provedor) e rode
+   `bamo secret delete <sec-id> --confirm <sec-id>`. Com a credencial
+   apagada, qualquer execução ou agenda existente passa a falhar fechada
+   com `secret_unavailable` — sem recriação automática nem acesso anônimo.
+
+O executor (`executors/github_read_repos.py`) usa host, caminho, query e
+método fixos em código (`api.github.com`, `GET /user/repos`, até 20 itens),
+recusa redirecionamento, valida TLS com a cadeia padrão do sistema, limita o
+corpo da resposta e nunca inclui o token em URL, argumento, variável de
+ambiente ou saída — o header de autenticação é montado só dentro do
+callback de acesso ao cofre (`vault.with_secret`), dentro do próprio
+processo executor.
 
 Memória de longo prazo e OKFs são criados **automaticamente** ao longo da
 conversa (sem confirmar item a item) sempre que houver evidência clara e a
@@ -142,10 +185,12 @@ registro normal da conversa; `bamo memory forget`/`session delete`/
   local); o cofre é o único lugar com garantia criptográfica, e só guarda o
   que o usuário grava explicitamente com `secret set` — nunca o que é dito
   em `chat`/`ask`.
-- O cofre não injeta segredos em nada (agy, shell, variáveis de ambiente,
-  clipboard) — o PRD-004 entrega a infraestrutura de conectores, mas nenhuma
-  capacidade real de serviço externo (ex.: LinkedIn, Instagram) usa
-  credencial nesta fase; isso é escopo de PRDs futuros por provider.
+- O cofre não injeta segredos em `agy`, chat, shell, variáveis de ambiente ou
+  clipboard. O PRD-005 entrega o primeiro provider real com credencial
+  (`github`, somente leitura); a credencial só existe brevemente na memória
+  do processo executor isolado durante a chamada HTTPS — outros serviços
+  (ex.: LinkedIn, Instagram) e qualquer capacidade de escrita continuam fora
+  de escopo, reservados a PRDs futuros por provider.
 
 ## Estrutura de dados
 
@@ -169,7 +214,8 @@ bamo-agent/
 ├── connector-audit/
 │   └── YYYY-MM.jsonl          # eventos de execução redigidos (gerado, não versionado, 0600)
 ├── executors/
-│   └── local_demo.py           # executor isolado do provider local-demo (versionado)
+│   ├── local_demo.py            # executor isolado do provider local-demo (versionado)
+│   └── github_read_repos.py     # executor isolado do provider github (versionado)
 └── settings.local.json       # {"learning_enabled": true|false} (gerado)
 ```
 
