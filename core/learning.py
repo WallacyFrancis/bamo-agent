@@ -49,7 +49,19 @@ def get_learning_enabled() -> bool:
 
 
 def set_learning_enabled(enabled: bool) -> None:
-    write_json_atomic(SETTINGS_PATH, {"learning_enabled": enabled})
+    # Lê-modifica-grava: settings.local.json também guarda `color_mode`/
+    # `plain` (PRD-007, core/ui.py) desde que esse arquivo passou a ter
+    # mais de uma chave — sobrescrever tudo aqui apagaria essas preferências.
+    data: dict = {}
+    if SETTINGS_PATH.exists():
+        try:
+            loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except json.JSONDecodeError:
+            pass
+    data["learning_enabled"] = enabled
+    write_json_atomic(SETTINGS_PATH, data)
 
 
 def _looks_sensitive(text: str, tags: list[str]) -> bool:

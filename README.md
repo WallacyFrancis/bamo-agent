@@ -28,6 +28,35 @@ python3 bamo.py ask "Liste os próximos passos deste projeto"
 `quit`, ou Ctrl+D) para encerrar. `ask` faz o mesmo fluxo para uma pergunta
 única, como uma conversa de um turno só.
 
+### Terminal e cor
+
+Em `bamo chat` interativo (TTY, sem `--plain`), o Bamo mostra uma xícara
+8-bit e "Uai, bamo trabalhar?" uma vez, e usa `☕ Bamo`/`Você ›` para
+identificar cada fala (fallback `[Bamo]` em terminal sem suporte a
+Unicode). Digite `/ajuda` para um menu rápido, `/status` para ver os cards
+de conector/agenda/alerta sem sair da conversa, ou `/alertas` para ver só
+os alertas — nenhum atalho executa conector, altera agenda/cofre ou vira
+ponte do chat para uma capacidade real (`core/ui.py` nunca importa cofre,
+dispatcher, executor, `agy_runtime` ou rede).
+
+```bash
+python3 bamo.py --color auto|always|never ...
+python3 bamo.py --plain|--no-plain ...
+```
+
+`--color`/`--plain`, quando informados, ficam salvos em
+`settings.local.json` como padrão dos próximos comandos (junto de
+`learning_enabled`, sem apagar um ao alterar o outro). `--color auto`
+(padrão) segue `NO_COLOR` e só usa cor com stdout interativo; `--plain` ou
+saída sem TTY (pipe, script, cron) desligam arte, cor e menus — a saída
+volta ao texto simples de sempre, previsível para automação. Todo texto
+renderizado passa por sanitização de ANSI/controle antes de ir ao
+terminal, mesmo vindo de conteúdo externo (nome de repositório, resumo de
+executor); IDs e comandos de confirmação (`--confirm <id>`) nunca são
+truncados nem alterados por isso. Nenhuma regra de confirmação muda: um
+menu nunca substitui `--confirm <id>` exigido pelos comandos de
+conector/agenda/alerta/cofre.
+
 ### Memória, sessões e conhecimento
 
 ```bash

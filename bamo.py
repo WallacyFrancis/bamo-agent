@@ -25,6 +25,7 @@ from core import (
     ranking,
     scheduler,
     sessions,
+    ui,
     vault,
 )
 from core.ids import InvalidIdError
@@ -32,6 +33,7 @@ from core.paths import ROOT
 from core.redact import redact
 
 EXIT_WORDS = {"sair", "/sair", "exit", "quit"}
+CHAT_SHORTCUTS = {"/ajuda", "/status", "/alertas"}
 
 
 def _agy_missing() -> int:
@@ -81,31 +83,89 @@ def cmd_ask(prompt: str) -> int:
     return 0 if ok else 1
 
 
+def _print_status_cards(connector_id: str | None = None) -> None:
+    alerts.cleanup_expired()
+    panel = operations.status(connector_id)
+    if not panel:
+        ui.notice("info", "Nenhum conector encontrado.")
+        return
+    for entry in panel:
+        ui.status_card(entry)
+
+
+def _print_alert_cards(connector_id: str | None = None, state: str | None = None) -> None:
+    alerts.cleanup_expired()
+    items = alerts.list_all(connector_id=connector_id, state=state)
+    if not items:
+        ui.notice("info", "Nenhum alerta encontrado.")
+        return
+    for record in items:
+        ui.alert_card(record)
+
+
+def _handle_chat_shortcut(command: str) -> bool:
+    """Comandos locais do chat (seção 6): só chamam o equivalente já
+    existente de `status`/`alert list` — nunca criam uma ponte do chat para
+    conectores (seção 3, fora de escopo). Retorna True se o chat deve
+    encerrar (opção "Sair" escolhida no menu de `/ajuda`)."""
+    if command == "/status":
+        _print_status_cards()
+        return False
+    if command == "/alertas":
+        _print_alert_cards()
+        return False
+    if command == "/ajuda":
+        choice = ui.menu(
+            "O que você quer fazer?",
+            [
+                ("status", "Consultar status dos conectores", "Mostra última execução e alertas abertos."),
+                ("alertas", "Ver alertas", "Lista itens que precisam de atenção."),
+                ("sair", "Sair", ""),
+            ],
+        )
+        if choice == "status":
+            _print_status_cards()
+        elif choice == "alertas":
+            _print_alert_cards()
+        elif choice == "sair":
+            return True
+        return False
+    return False
+
+
 def cmd_chat() -> int:
     if not agy_runtime.agy_available():
         return _agy_missing()
 
     sessions.cleanup_expired()
     session = sessions.create(ROOT)
-    print(f"Bamo pronto (sessão {session['id']}). Digite sua mensagem ou 'sair' para encerrar.")
+    ui.banner()
+    ui.session_header()
+    ui.system_message(f"sessão {session['id']} iniciada — digite 'sair' para encerrar")
 
     try:
         while True:
             try:
-                user_text = input("Você: ")
+                user_text = input(ui.user_prompt_label())
             except EOFError:
                 print()
                 break
-            if user_text.strip().lower() in EXIT_WORDS:
+            stripped = user_text.strip()
+            lowered = stripped.lower()
+            if lowered in EXIT_WORDS:
                 break
-            if not user_text.strip():
+            if not stripped:
+                continue
+            if lowered in CHAT_SHORTCUTS:
+                if _handle_chat_shortcut(lowered):
+                    break
                 continue
 
             ok, text = _run_turn(session, user_text)
             if ok:
-                print(f"Bamo: {text}")
+                ui.bamo_message(text)
             else:
-                print(f"Bamo: [erro: {text}]")
+                ui.notice("error", text)
                 continue
 
             learning.run_cycle(session, final=False)
@@ -114,7 +174,7 @@ def cmd_chat() -> int:
     finally:
         learning.run_cycle(session, final=True)
         sessions.end(session)
-        print(f"[sessão {session['id']} encerrada]")
+        ui.system_message(f"sessão {session['id']} encerrada")
 
     return 0
 
@@ -589,13 +649,20 @@ def cmd_connector_run(connector_id: str, capability: str, confirm: str | None) -
         return 2
 
     if confirm != connector_id:
-        print(f"Conector: {connector_id} ({connector['display_name']}, provider={connector['provider']})")
-        print(f"Capacidade: {capability} ({cap_def['kind']}) — {cap_def['description']}")
-        print(f"Para confirmar a execução, rode: bamo connector run {connector_id} {capability} --confirm {connector_id}")
+        ui.confirmation(
+            f"Executar {capability}",
+            {
+                "Ação": f"{connector['display_name']} (provider={connector['provider']})",
+                "Efeito": f"{cap_def['kind']} — {cap_def['description']}",
+                "Conector": connector_id,
+                "Credencial": "não será exibida nem enviada ao modelo",
+            },
+            f"bamo connector run {connector_id} {capability} --confirm {connector_id}",
+        )
         return 2
 
     if not connector["enabled"]:
-        print("Erro: conector desabilitado.", file=sys.stderr)
+        ui.notice("error", "conector desabilitado.")
         return 1
 
     started_at = datetime.now(timezone.utc).isoformat()
@@ -626,12 +693,12 @@ def cmd_connector_run(connector_id: str, capability: str, confirm: str | None) -
         ended_at=ended_at,
     )
     if should_announce and alert is not None:
-        print(f"ALERTA: [{alert['id']}] {alert['type']} ({alert['severity']}) — {alert['message']}", file=sys.stderr)
+        ui.notice("alert", f"[{alert['id']}] {alert['type']} ({alert['severity']}) — {alert['message']}")
 
     if not ok:
-        print(f"Erro: execução falhou ({status}): {summary}", file=sys.stderr)
+        ui.notice("error", f"execução falhou ({status}): {summary}")
         return 1
-    print(f"OK ({status}): {summary}")
+    ui.notice("success", f"({status}) {summary}")
     return 0
 
 
@@ -721,7 +788,7 @@ def cmd_scheduler_run() -> int:
             ended_at=r["ended_at"],
         )
         if should_announce and alert is not None:
-            print(f"ALERTA: [{alert['id']}] {alert['type']} ({alert['severity']}) — {alert['message']}", file=sys.stderr)
+            ui.notice("alert", f"[{alert['id']}] {alert['type']} ({alert['severity']}) — {alert['message']}")
     return 0
 
 
@@ -730,6 +797,10 @@ def cmd_status(connector_id: str | None) -> int:
     panel = operations.status(connector_id)
     if not panel:
         print("(nenhum conector encontrado)")
+        return 0
+    if ui.should_render_rich():
+        for c in panel:
+            ui.status_card(c)
         return 0
     for c in panel:
         estado = "habilitado" if c["enabled"] else "desabilitado"
@@ -762,6 +833,10 @@ def cmd_alert_list(state: str | None, connector_id: str | None) -> int:
     if not items:
         print("(nenhum alerta encontrado)")
         return 0
+    if ui.should_render_rich():
+        for a in items:
+            ui.alert_card(a)
+        return 0
     for a in items:
         print(f"[{a['id']}] {a['type']} ({a['severity']}, {a['state']}) conector={a['connector_id']} capacidade={a['capability']} contador={a['count']} última_ocorrência={a['last_seen_at']}")
     return 0
@@ -776,6 +851,9 @@ def cmd_alert_show(alert_id: str) -> int:
     if record is None:
         print(f"Alerta não encontrado: {alert_id}", file=sys.stderr)
         return 1
+    if ui.should_render_rich():
+        ui.alert_card(record)
+        return 0
     print(json.dumps(record, ensure_ascii=False, indent=2))
     return 0
 
@@ -836,6 +914,14 @@ def cmd_operations_list(connector_id: str | None, limit: int | None) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="bamo-agent (runtime: agy)")
+    parser.add_argument(
+        "--color", choices=["auto", "always", "never"], default=None,
+        help="controla cor no terminal (padrão: o que estiver salvo, ou 'auto')",
+    )
+    parser.add_argument(
+        "--plain", action=argparse.BooleanOptionalAction, default=None,
+        help="desliga arte, cor e menus (padrão: o que estiver salvo, ou desligado)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("chat", help="abre uma sessão de conversa mediada pelo Bamo")
@@ -1015,6 +1101,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    stored_color, stored_plain = ui.load_display_settings()
+    color_mode = args.color if args.color is not None else stored_color
+    plain = args.plain if args.plain is not None else stored_plain
+    if args.color is not None or args.plain is not None:
+        ui.save_display_settings(color_mode, plain)
+    ui.configure(color_mode, plain)
 
     try:
         if args.command == "chat":
