@@ -18,3 +18,7 @@ secrets/
 connectors/
 schedules/
 connector-audit/
+
+# Alertas e resumo operacional (PRD-006) — dados operacionais locais
+alerts/
+operations/

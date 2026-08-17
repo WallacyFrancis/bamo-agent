@@ -163,6 +163,50 @@ ambiente ou saída — o header de autenticação é montado só dentro do
 callback de acesso ao cofre (`vault.with_secret`), dentro do próprio
 processo executor.
 
+### Status e alertas
+
+```bash
+python3 bamo.py status
+python3 bamo.py status --connector <conn-id>
+
+python3 bamo.py alert list [--state open|acknowledged|muted] [--connector <conn-id>]
+python3 bamo.py alert show <alert-id>
+python3 bamo.py alert acknowledge <alert-id> --confirm <alert-id>
+python3 bamo.py alert mute <alert-id> --for <minutos> --confirm <alert-id>
+python3 bamo.py alert unmute <alert-id> --confirm <alert-id>
+
+python3 bamo.py operations list [--connector <conn-id>] [--limit <n>]
+```
+
+`status` mostra, para cada conector, a última execução segura (sem resumo
+remoto), as agendas com o próximo disparo calculado e os alertas abertos —
+sem desbloquear o cofre, sem rede e sem chamar `agy` (`core/operations.py`
+só lê `connectors/`, `schedules/`, `connector-audit/` e `alerts/`, já
+validados; nunca importa `vault`, executor, `agy_runtime`, `subprocess` ou
+biblioteca de rede).
+
+Toda execução — manual ou por agenda — passa por um classificador
+operacional (`core/alerts.py`) logo após ser gravada em `connector-audit/`:
+falha nova abre um alerta `execution_failed`; três falhas seguidas da mesma
+capacidade elevam o mesmo alerta para `repeated_failure`; `secret_unavailable`,
+`unauthorized`/`forbidden`, `rate_limited` e `connector_unavailable` geram um
+alerta específico imediato. Um sucesso encerra só os alertas transitórios de
+falha; alertas de credencial/acesso/rate-limit exigem revisão humana
+explícita mesmo depois de uma execução bem-sucedida. Nada disso reexecuta o
+conector, muda uma agenda ou tenta corrigir a credencial sozinho — é só
+observação e registro.
+
+`bamo scheduler run` imprime uma linha `ALERTA` para todo alerta novo ou que
+acabou de escalar de tipo; atualizações silenciosas (contador, última
+ocorrência) não repetem o aviso a cada ciclo. `alert acknowledge` só marca
+que um humano viu o alerta; `alert mute` aceita de 5 minutos a 7 dias e
+volta a `open` sozinho quando vence, se a condição ainda persistir, ou por
+`alert unmute` explícito antes disso. Nenhum desses comandos executa
+conector, altera agenda ou usa segredo. `operations list` mostra o registro
+estruturado de cada execução (tempo, conector, capacidade, agenda, origem,
+status, severidade) sem o resumo redigido — para o resumo completo de uma
+execução, use `bamo connector audit`.
+
 Memória de longo prazo e OKFs são criados **automaticamente** ao longo da
 conversa (sem confirmar item a item) sempre que houver evidência clara e a
 informação for durável — nunca para dados sensíveis (saúde, biometria,
@@ -191,6 +235,11 @@ registro normal da conversa; `bamo memory forget`/`session delete`/
   do processo executor isolado durante a chamada HTTPS — outros serviços
   (ex.: LinkedIn, Instagram) e qualquer capacidade de escrita continuam fora
   de escopo, reservados a PRDs futuros por provider.
+- Alertas e resumo operacional (PRD-006) são retidos por 30 dias, limpos ao
+  usar `status`, `alert list` ou `operations list`; nenhuma notificação sai
+  do computador — e-mail, Telegram, Discord, Slack ou webhook ficam para um
+  PRD posterior. O Bamo nunca reexecuta um conector, muda uma agenda ou
+  tenta corrigir uma credencial sozinho a partir de um alerta.
 
 ## Estrutura de dados
 
@@ -213,6 +262,10 @@ bamo-agent/
 │   └── sched-*.json           # agenda local de conector (gerado, não versionado, 0600)
 ├── connector-audit/
 │   └── YYYY-MM.jsonl          # eventos de execução redigidos (gerado, não versionado, 0600)
+├── alerts/
+│   └── alert-*.json           # alerta operacional deduplicado (gerado, não versionado, 0600)
+├── operations/
+│   └── YYYY-MM.jsonl          # resumo operacional estruturado (gerado, não versionado, 0600)
 ├── executors/
 │   ├── local_demo.py            # executor isolado do provider local-demo (versionado)
 │   └── github_read_repos.py     # executor isolado do provider github (versionado)

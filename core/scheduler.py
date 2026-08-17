@@ -356,17 +356,27 @@ def run_due() -> list[dict[str, Any]]:
                 connector = None
             if connector is None or not connector["enabled"]:
                 status = "connector_unavailable"
+                ended_at = _now_iso()
                 _mark_run(record, now, status)
                 connector_audit.append_event(
                     connector_id=record["connector_id"],
                     capability=record["capability"],
                     origin="schedule",
                     started_at=started_at,
-                    ended_at=_now_iso(),
+                    ended_at=ended_at,
                     ok=False,
                     status=status,
                 )
-                results.append({"schedule_id": record["id"], "ok": False, "status": status})
+                results.append(
+                    {
+                        "schedule_id": record["id"],
+                        "connector_id": record["connector_id"],
+                        "capability": record["capability"],
+                        "ok": False,
+                        "status": status,
+                        "ended_at": ended_at,
+                    }
+                )
                 continue
 
             try:
@@ -387,5 +397,14 @@ def run_due() -> list[dict[str, Any]]:
                 status=status,
                 summary=summary,
             )
-            results.append({"schedule_id": record["id"], "ok": ok, "status": status})
+            results.append(
+                {
+                    "schedule_id": record["id"],
+                    "connector_id": record["connector_id"],
+                    "capability": record["capability"],
+                    "ok": ok,
+                    "status": status,
+                    "ended_at": ended_at,
+                }
+            )
     return results

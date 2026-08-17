@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from core import (
     agy_runtime,
+    alerts,
     connector_audit,
     connectors,
     context_builder,
@@ -20,6 +21,7 @@ from core import (
     knowledge_store,
     learning,
     memory_store,
+    operations,
     ranking,
     scheduler,
     sessions,
@@ -539,6 +541,37 @@ def cmd_connector_delete(connector_id: str, confirm: str | None) -> int:
     return 0
 
 
+def _process_operational_event(
+    *,
+    connector_id: str,
+    capability: str,
+    schedule_id: str | None,
+    origin: str,
+    ok: bool,
+    status: str,
+    ended_at: str,
+) -> tuple[dict | None, bool]:
+    """Classificação/gravação de alerta e operações (PRD-006) nunca pode
+    interromper uma execução que o conector já concluiu, nem derrubar o
+    processamento das demais agendas de `scheduler run`: qualquer falha
+    aqui (disco, arquivo corrompido, etc.) vira um aviso genérico fixo — a
+    mensagem nunca inclui `str(exc)`, para não arriscar persistir/exibir
+    algo fora da allowlist de status."""
+    try:
+        return operations.process_event(
+            connector_id=connector_id,
+            capability=capability,
+            schedule_id=schedule_id,
+            origin=origin,
+            ok=ok,
+            status=status,
+            ended_at=ended_at,
+        )
+    except Exception:
+        print("Aviso: falha ao registrar alerta/operação (resultado da execução não foi afetado).", file=sys.stderr)
+        return None, False
+
+
 def cmd_connector_run(connector_id: str, capability: str, confirm: str | None) -> int:
     try:
         connector = connectors.load(connector_id)
@@ -583,6 +616,17 @@ def cmd_connector_run(connector_id: str, capability: str, confirm: str | None) -
         status=status,
         summary=summary,
     )
+    alert, should_announce = _process_operational_event(
+        connector_id=connector_id,
+        capability=capability,
+        schedule_id=None,
+        origin="manual",
+        ok=ok,
+        status=status,
+        ended_at=ended_at,
+    )
+    if should_announce and alert is not None:
+        print(f"ALERTA: [{alert['id']}] {alert['type']} ({alert['severity']}) — {alert['message']}", file=sys.stderr)
 
     if not ok:
         print(f"Erro: execução falhou ({status}): {summary}", file=sys.stderr)
@@ -667,6 +711,126 @@ def cmd_scheduler_run() -> int:
         return 0
     for r in results:
         print(f"[{r['schedule_id']}] {r['status']} (ok={r['ok']})")
+        alert, should_announce = _process_operational_event(
+            connector_id=r["connector_id"],
+            capability=r["capability"],
+            schedule_id=r["schedule_id"],
+            origin="schedule",
+            ok=r["ok"],
+            status=r["status"],
+            ended_at=r["ended_at"],
+        )
+        if should_announce and alert is not None:
+            print(f"ALERTA: [{alert['id']}] {alert['type']} ({alert['severity']}) — {alert['message']}", file=sys.stderr)
+    return 0
+
+
+def cmd_status(connector_id: str | None) -> int:
+    alerts.cleanup_expired()
+    panel = operations.status(connector_id)
+    if not panel:
+        print("(nenhum conector encontrado)")
+        return 0
+    for c in panel:
+        estado = "habilitado" if c["enabled"] else "desabilitado"
+        print(f"[{c['connector_id']}] {c['display_name']} (provider={c['provider']}, {estado})")
+        last = c["last_execution"]
+        if last:
+            print(f"  última execução: {last['at']} capacidade={last['capability']} origem={last['origin']} ok={last['ok']} status={last['status']}")
+        else:
+            print("  última execução: nunca")
+        if not c["schedules"]:
+            print("  agendas: nenhuma")
+        for s in c["schedules"]:
+            estado_s = "habilitada" if s["enabled"] else "desabilitada"
+            print(f"  agenda [{s['id']}] {s['capability']} a cada {s['every_minutes']}min ({estado_s}) — próximo disparo: {s['next_due'] or '-'}")
+        if c["open_alerts"]:
+            for a in c["open_alerts"]:
+                print(f"  ALERTA [{a['id']}] {a['type']} ({a['severity']}, {a['state']})")
+        else:
+            print("  alertas: nenhum aberto")
+    return 0
+
+
+def cmd_alert_list(state: str | None, connector_id: str | None) -> int:
+    alerts.cleanup_expired()
+    try:
+        items = alerts.list_all(connector_id=connector_id, state=state)
+    except alerts.AlertError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    if not items:
+        print("(nenhum alerta encontrado)")
+        return 0
+    for a in items:
+        print(f"[{a['id']}] {a['type']} ({a['severity']}, {a['state']}) conector={a['connector_id']} capacidade={a['capability']} contador={a['count']} última_ocorrência={a['last_seen_at']}")
+    return 0
+
+
+def cmd_alert_show(alert_id: str) -> int:
+    try:
+        record = alerts.load(alert_id)
+    except alerts.AlertError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    if record is None:
+        print(f"Alerta não encontrado: {alert_id}", file=sys.stderr)
+        return 1
+    print(json.dumps(record, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_alert_acknowledge(alert_id: str, confirm: str | None) -> int:
+    if confirm != alert_id:
+        print(f"Alvo: {alert_id}")
+        print(f"Para confirmar, rode: bamo alert acknowledge {alert_id} --confirm {alert_id}")
+        return 2
+    try:
+        alerts.acknowledge(alert_id)
+    except alerts.AlertError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    print(f"Alerta reconhecido: {alert_id}")
+    return 0
+
+
+def cmd_alert_mute(alert_id: str, minutes: int, confirm: str | None) -> int:
+    if confirm != alert_id:
+        print(f"Alvo: {alert_id}")
+        print(f"Para confirmar, rode: bamo alert mute {alert_id} --for {minutes} --confirm {alert_id}")
+        return 2
+    try:
+        alerts.mute(alert_id, minutes)
+    except alerts.AlertError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    print(f"Alerta silenciado por {minutes} minuto(s): {alert_id}")
+    return 0
+
+
+def cmd_alert_unmute(alert_id: str, confirm: str | None) -> int:
+    if confirm != alert_id:
+        print(f"Alvo: {alert_id}")
+        print(f"Para confirmar, rode: bamo alert unmute {alert_id} --confirm {alert_id}")
+        return 2
+    try:
+        alerts.unmute(alert_id)
+    except alerts.AlertError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    print(f"Alerta reativado: {alert_id}")
+    return 0
+
+
+def cmd_operations_list(connector_id: str | None, limit: int | None) -> int:
+    operations.cleanup_expired()
+    rows = operations.list_events(connector_id=connector_id, limit=limit)
+    if not rows:
+        print("(nenhum registro operacional encontrado)")
+        return 0
+    for r in rows:
+        sched = r.get("schedule_id") or "-"
+        print(f"{r['at']} conector={r['connector_id']} capacidade={r['capability']} agenda={sched} origem={r['origin']} ok={r['ok']} status={r['status']} severidade={r['severity']}")
     return 0
 
 
@@ -813,6 +977,38 @@ def build_parser() -> argparse.ArgumentParser:
     scheduler_sub = scheduler_p.add_subparsers(dest="scheduler_command", required=True)
     scheduler_sub.add_parser("run", help="executa agora, uma única vez, as agendas devidas")
 
+    status_p = sub.add_parser("status", help="painel de saúde de conectores e agendas (PRD-006)")
+    status_p.add_argument("--connector", default=None, dest="connector_id")
+
+    alert_p = sub.add_parser("alert", help="gerencia alertas operacionais derivados da auditoria (PRD-006)")
+    alert_sub = alert_p.add_subparsers(dest="alert_command", required=True)
+
+    a_list = alert_sub.add_parser("list", help="lista alertas")
+    a_list.add_argument("--state", default=None, choices=["open", "acknowledged", "muted"])
+    a_list.add_argument("--connector", default=None, dest="connector_id")
+
+    a_show = alert_sub.add_parser("show", help="mostra um alerta")
+    a_show.add_argument("id")
+
+    a_ack = alert_sub.add_parser("acknowledge", help="reconhece um alerta (exige --confirm)")
+    a_ack.add_argument("id")
+    a_ack.add_argument("--confirm", default=None)
+
+    a_mute = alert_sub.add_parser("mute", help="silencia um alerta por um período (exige --confirm)")
+    a_mute.add_argument("id")
+    a_mute.add_argument("--for", type=int, required=True, dest="minutes", metavar="MINUTOS")
+    a_mute.add_argument("--confirm", default=None)
+
+    a_unmute = alert_sub.add_parser("unmute", help="reativa um alerta silenciado (exige --confirm)")
+    a_unmute.add_argument("id")
+    a_unmute.add_argument("--confirm", default=None)
+
+    ops_p = sub.add_parser("operations", help="lista o resumo operacional derivado da auditoria (PRD-006)")
+    ops_sub = ops_p.add_subparsers(dest="operations_command", required=True)
+    ops_list = ops_sub.add_parser("list", help="lista registros operacionais")
+    ops_list.add_argument("--connector", default=None, dest="connector_id")
+    ops_list.add_argument("--limit", type=int, default=None)
+
     return parser
 
 
@@ -901,6 +1097,22 @@ def main() -> int:
         if args.command == "scheduler":
             if args.scheduler_command == "run":
                 return cmd_scheduler_run()
+        if args.command == "status":
+            return cmd_status(args.connector_id)
+        if args.command == "alert":
+            if args.alert_command == "list":
+                return cmd_alert_list(args.state, args.connector_id)
+            if args.alert_command == "show":
+                return cmd_alert_show(args.id)
+            if args.alert_command == "acknowledge":
+                return cmd_alert_acknowledge(args.id, args.confirm)
+            if args.alert_command == "mute":
+                return cmd_alert_mute(args.id, args.minutes, args.confirm)
+            if args.alert_command == "unmute":
+                return cmd_alert_unmute(args.id, args.confirm)
+        if args.command == "operations":
+            if args.operations_command == "list":
+                return cmd_operations_list(args.connector_id, args.limit)
     except InvalidIdError as exc:
         print(f"Erro: {exc}", file=sys.stderr)
         return 2
