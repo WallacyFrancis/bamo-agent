@@ -13,3 +13,8 @@ settings.local.json
 # Cofre local de segredos (PRD-003) — nunca versionar
 secrets/
 *.tmp
+
+# Conectores, agendas e auditoria (PRD-004) — dados operacionais locais
+connectors/
+schedules/
+connector-audit/

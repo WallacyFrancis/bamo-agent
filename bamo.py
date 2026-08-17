@@ -8,8 +8,22 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 
-from core import agy_runtime, context_builder, knowledge_store, learning, memory_store, ranking, sessions, vault
+from core import (
+    agy_runtime,
+    connector_audit,
+    connectors,
+    context_builder,
+    dispatcher,
+    knowledge_store,
+    learning,
+    memory_store,
+    ranking,
+    scheduler,
+    sessions,
+    vault,
+)
 from core.ids import InvalidIdError
 from core.paths import ROOT
 from core.redact import redact
@@ -390,6 +404,221 @@ def cmd_secret_audit() -> int:
     return 0
 
 
+def cmd_connector_list() -> int:
+    try:
+        items = connectors.list_all()
+    except connectors.ConnectorError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    if not items:
+        print("(nenhum conector encontrado)")
+        return 0
+    for c in items:
+        estado = "habilitado" if c["enabled"] else "desabilitado"
+        print(f"[{c['id']}] {c['display_name']} (provider={c['provider']}, {estado}) — capacidades: {', '.join(c['capabilities'])}")
+    return 0
+
+
+def cmd_connector_show(connector_id: str) -> int:
+    try:
+        connector = connectors.load(connector_id)
+    except connectors.ConnectorError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    if connector is None:
+        print(f"Conector não encontrado: {connector_id}", file=sys.stderr)
+        return 1
+    print(json.dumps(connector, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_connector_create_demo(name: str) -> int:
+    try:
+        record = connectors.create_demo(name)
+    except connectors.ConnectorError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    print(f"Conector criado: {record['id']} ({record['display_name']}, provider={record['provider']})")
+    return 0
+
+
+def cmd_connector_enable(connector_id: str, confirm: str | None) -> int:
+    if confirm != connector_id:
+        print(f"Alvo: {connector_id}")
+        print(f"Para confirmar, rode: bamo connector enable {connector_id} --confirm {connector_id}")
+        return 2
+    try:
+        connectors.enable(connector_id)
+    except connectors.ConnectorError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    print(f"Conector habilitado: {connector_id}")
+    return 0
+
+
+def cmd_connector_disable(connector_id: str, confirm: str | None) -> int:
+    if confirm != connector_id:
+        print(f"Alvo: {connector_id}")
+        print(f"Para confirmar, rode: bamo connector disable {connector_id} --confirm {connector_id}")
+        return 2
+    try:
+        connectors.disable(connector_id)
+    except connectors.ConnectorError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    print(f"Conector desabilitado: {connector_id}")
+    return 0
+
+
+def cmd_connector_delete(connector_id: str, confirm: str | None) -> int:
+    if confirm != connector_id:
+        print(f"Alvo: {connector_id}")
+        print(f"Para confirmar a exclusão, rode: bamo connector delete {connector_id} --confirm {connector_id}")
+        return 2
+    try:
+        found = connectors.delete(connector_id)
+    except connectors.ConnectorError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    if not found:
+        print(f"Conector não encontrado: {connector_id}", file=sys.stderr)
+        return 1
+    removed_schedules = scheduler.delete_for_connector(connector_id)
+    print(f"Conector removido: {connector_id} ({removed_schedules} agenda(s) associada(s) removida(s))")
+    return 0
+
+
+def cmd_connector_run(connector_id: str, capability: str, confirm: str | None) -> int:
+    try:
+        connector = connectors.load(connector_id)
+    except connectors.ConnectorError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    if connector is None:
+        print(f"Conector não encontrado: {connector_id}", file=sys.stderr)
+        return 1
+
+    provider = connectors.PROVIDERS.get(connector["provider"])
+    cap_def = provider["capabilities"].get(capability) if provider else None
+    if cap_def is None or capability not in connector["capabilities"]:
+        print(f"Erro: capacidade não habilitada para este conector: {capability}", file=sys.stderr)
+        return 2
+
+    if confirm != connector_id:
+        print(f"Conector: {connector_id} ({connector['display_name']}, provider={connector['provider']})")
+        print(f"Capacidade: {capability} ({cap_def['kind']}) — {cap_def['description']}")
+        print(f"Para confirmar a execução, rode: bamo connector run {connector_id} {capability} --confirm {connector_id}")
+        return 2
+
+    if not connector["enabled"]:
+        print("Erro: conector desabilitado.", file=sys.stderr)
+        return 1
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        outcome = dispatcher.run_capability(connector, capability)
+        ok, status, summary = outcome["ok"], outcome["status"], outcome["summary"]
+    except dispatcher.DispatcherError as exc:
+        ok, status, summary = False, exc.__class__.__name__, str(exc)
+    ended_at = datetime.now(timezone.utc).isoformat()
+
+    connector_audit.append_event(
+        connector_id=connector_id,
+        capability=capability,
+        origin="manual",
+        started_at=started_at,
+        ended_at=ended_at,
+        ok=ok,
+        status=status,
+        summary=summary,
+    )
+
+    if not ok:
+        print(f"Erro: execução falhou ({status}): {summary}", file=sys.stderr)
+        return 1
+    print(f"OK ({status}): {summary}")
+    return 0
+
+
+def cmd_connector_audit(connector_id: str | None) -> int:
+    connector_audit.cleanup_expired()
+    events = connector_audit.list_events(connector_id)
+    if not events:
+        print("(nenhum evento de auditoria)")
+        return 0
+    for e in events:
+        print(f"{e['at']} conector={e['connector_id']} capacidade={e['capability']} origem={e['origin']} ok={e['ok']} status={e['status']}")
+    return 0
+
+
+def cmd_schedule_set(connector_id: str, capability: str, every_minutes: int, confirm: str | None) -> int:
+    if confirm != connector_id:
+        print(f"Alvo: {connector_id}")
+        print(
+            f"Para confirmar, rode: bamo schedule set {connector_id} {capability} "
+            f"--every {every_minutes} --confirm {connector_id}"
+        )
+        return 2
+    try:
+        record = scheduler.set_schedule(connector_id, capability, every_minutes)
+    except scheduler.SchedulerError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    print(f"Agenda criada: {record['id']} ({connector_id}/{capability} a cada {every_minutes} min)")
+    return 0
+
+
+def cmd_schedule_list() -> int:
+    try:
+        items = scheduler.list_all()
+    except scheduler.SchedulerError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    if not items:
+        print("(nenhuma agenda encontrada)")
+        return 0
+    for s in items:
+        estado = "habilitada" if s["enabled"] else "desabilitada"
+        last = s["last_run_at"] or "nunca"
+        print(f"[{s['id']}] {s['connector_id']}/{s['capability']} a cada {s['every_minutes']}min ({estado}) — última execução: {last}")
+    return 0
+
+
+def cmd_schedule_disable(schedule_id: str, confirm: str | None) -> int:
+    if confirm != schedule_id:
+        print(f"Alvo: {schedule_id}")
+        print(f"Para confirmar, rode: bamo schedule disable {schedule_id} --confirm {schedule_id}")
+        return 2
+    try:
+        found = scheduler.disable(schedule_id)
+    except scheduler.SchedulerError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    if found:
+        print(f"Agenda desabilitada: {schedule_id}")
+        return 0
+    print(f"Agenda não encontrada: {schedule_id}", file=sys.stderr)
+    return 1
+
+
+def cmd_scheduler_run() -> int:
+    connector_audit.cleanup_expired()
+    try:
+        results = scheduler.run_due()
+    except scheduler.SchedulerBusyError as exc:
+        print(f"Aviso: {exc}", file=sys.stderr)
+        return 0
+    except scheduler.SchedulerError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        return 1
+    if not results:
+        print("(nenhuma agenda devida agora)")
+        return 0
+    for r in results:
+        print(f"[{r['schedule_id']}] {r['status']} (ok={r['ok']})")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="bamo-agent (runtime: agy)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -476,6 +705,56 @@ def build_parser() -> argparse.ArgumentParser:
 
     secret_sub.add_parser("audit", help="mostra o log de auditoria do cofre (sem rótulos/valores)")
 
+    connector_p = sub.add_parser("connector", help="gerencia conectores com capacidades explícitas (PRD-004)")
+    connector_sub = connector_p.add_subparsers(dest="connector_command", required=True)
+
+    connector_sub.add_parser("list", help="lista conectores")
+
+    c_show = connector_sub.add_parser("show", help="mostra um conector")
+    c_show.add_argument("id")
+
+    c_create = connector_sub.add_parser("create-demo", help="cria o conector de demonstração local-demo")
+    c_create.add_argument("nome")
+
+    c_enable = connector_sub.add_parser("enable", help="habilita um conector (exige --confirm)")
+    c_enable.add_argument("id")
+    c_enable.add_argument("--confirm", default=None)
+
+    c_disable = connector_sub.add_parser("disable", help="desabilita um conector (exige --confirm)")
+    c_disable.add_argument("id")
+    c_disable.add_argument("--confirm", default=None)
+
+    c_delete = connector_sub.add_parser("delete", help="apaga um conector e suas agendas (exige --confirm)")
+    c_delete.add_argument("id")
+    c_delete.add_argument("--confirm", default=None)
+
+    c_run = connector_sub.add_parser("run", help="executa uma capacidade do conector (exige --confirm)")
+    c_run.add_argument("id")
+    c_run.add_argument("capability")
+    c_run.add_argument("--confirm", default=None)
+
+    c_audit = connector_sub.add_parser("audit", help="mostra o log de auditoria de conectores")
+    c_audit.add_argument("--connector", default=None)
+
+    schedule_p = sub.add_parser("schedule", help="gerencia agendas locais de conectores (PRD-004)")
+    schedule_sub = schedule_p.add_subparsers(dest="schedule_command", required=True)
+
+    sc_set = schedule_sub.add_parser("set", help="cria uma agenda para uma capacidade read/notify (exige --confirm)")
+    sc_set.add_argument("connector_id")
+    sc_set.add_argument("capability")
+    sc_set.add_argument("--every", type=int, required=True, dest="every_minutes", metavar="MINUTOS")
+    sc_set.add_argument("--confirm", default=None)
+
+    schedule_sub.add_parser("list", help="lista agendas")
+
+    sc_disable = schedule_sub.add_parser("disable", help="desabilita uma agenda (exige --confirm)")
+    sc_disable.add_argument("id")
+    sc_disable.add_argument("--confirm", default=None)
+
+    scheduler_p = sub.add_parser("scheduler", help="roda agendas devidas (uso: acionado pelo cron do sistema)")
+    scheduler_sub = scheduler_p.add_subparsers(dest="scheduler_command", required=True)
+    scheduler_sub.add_parser("run", help="executa agora, uma única vez, as agendas devidas")
+
     return parser
 
 
@@ -535,6 +814,33 @@ def main() -> int:
                 return cmd_secret_delete(args.id, args.confirm)
             if args.secret_command == "audit":
                 return cmd_secret_audit()
+        if args.command == "connector":
+            if args.connector_command == "list":
+                return cmd_connector_list()
+            if args.connector_command == "show":
+                return cmd_connector_show(args.id)
+            if args.connector_command == "create-demo":
+                return cmd_connector_create_demo(args.nome)
+            if args.connector_command == "enable":
+                return cmd_connector_enable(args.id, args.confirm)
+            if args.connector_command == "disable":
+                return cmd_connector_disable(args.id, args.confirm)
+            if args.connector_command == "delete":
+                return cmd_connector_delete(args.id, args.confirm)
+            if args.connector_command == "run":
+                return cmd_connector_run(args.id, args.capability, args.confirm)
+            if args.connector_command == "audit":
+                return cmd_connector_audit(args.connector)
+        if args.command == "schedule":
+            if args.schedule_command == "set":
+                return cmd_schedule_set(args.connector_id, args.capability, args.every_minutes, args.confirm)
+            if args.schedule_command == "list":
+                return cmd_schedule_list()
+            if args.schedule_command == "disable":
+                return cmd_schedule_disable(args.id, args.confirm)
+        if args.command == "scheduler":
+            if args.scheduler_command == "run":
+                return cmd_scheduler_run()
     except InvalidIdError as exc:
         print(f"Erro: {exc}", file=sys.stderr)
         return 2
