@@ -32,6 +32,13 @@ from .paths import SETTINGS_PATH
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-Z\\-_]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+
+def _visible_len(text: str) -> int:
+    """Comprimento em colunas de terminal, ignorando sequências ANSI —
+    todo cálculo de padding de caixa/coluna usa isto, nunca `len()` direto,
+    para bordas nunca desalinharem por causa de código de cor embutido."""
+    return len(_ANSI_RE.sub("", text))
+
 _COLORS = {
     "reset": "\x1b[0m",
     "bold": "\x1b[1m",
@@ -201,17 +208,178 @@ def _use_boxes() -> bool:
     return width >= _NARROW_WIDTH
 
 
-# --- identidade e mensagens ----------------------------------------------
+# --- banner (moldura TrueColor + pixel art em half-blocks) ---------------
+
+_BANNER_ORANGE = (249, 115, 22)
+_BANNER_SOLAR = (255, 215, 0)
+_BANNER_AMBER = (230, 160, 20)
+_BANNER_WHITE = (255, 255, 255)
+_BANNER_CREME = (240, 235, 220)
+_BANNER_COFFEE = (90, 50, 20)
+_BANNER_GOLD = (230, 180, 40)
+_BANNER_SHADOW = (140, 95, 15)
+_BANNER_MUTED = (150, 150, 150)
+
+_BANNER_WIDTH = 76  # colunas totais, bordas inclusas (faixa pedida: 74-78)
+_BANNER_TITLE = "BAMO – AGENT"
+
+_CUP_W = 18
 
 
-def banner() -> None:
-    if not should_render_rich():
-        return
+def _cup_row(*placements: tuple[int, str]) -> str:
+    cells = [" "] * _CUP_W
+    for col, ch in placements:
+        cells[col] = ch
+    return "".join(cells)
+
+
+# Cada string é uma linha de "pixels" (1 caractere = 1 pixel); duas linhas
+# formam uma linha de half-blocks (`▀`) na hora de renderizar — ver
+# `_half_block_lines()`.
+_CUP_PIXELS = [
+    _cup_row((6, "."), (9, ","), (12, ".")),  # vapor
+    _cup_row((6, "."), (9, ","), (12, ".")),
+    _cup_row((5, "."), (9, ","), (13, ".")),
+    _cup_row((5, "."), (9, ","), (13, ".")),
+    _cup_row((6, "."), (9, ","), (12, ".")),
+    _cup_row((6, "."), (9, ","), (12, ".")),
+    _cup_row(*[(c, "W") for c in (4, 14)], *[(c, "C") for c in range(5, 14)]),  # borda + café
+    _cup_row(*[(c, "Y") for c in range(4, 15)], (15, "W")),  # corpo — ouro
+    _cup_row(*[(c, "W") for c in range(4, 15)], (16, "W")),  # corpo — branco
+    _cup_row(*[(c, "Y") for c in range(4, 15)], (17, "W")),
+    _cup_row(*[(c, "W") for c in range(4, 15)], (17, "W")),
+    _cup_row(*[(c, "Y") for c in range(4, 15)], (16, "W")),
+    _cup_row(*[(c, "W") for c in range(4, 15)], (15, "W")),
+    _cup_row(*[(c, "Y") for c in range(5, 14)]),  # base
+    _cup_row(*[(c, "B") for c in range(6, 13)]),
+    _cup_row(*[(c, "B") for c in range(7, 12)]),
+]
+
+_CUP_LEGEND: dict[str, tuple[int, int, int]] = {
+    ".": _BANNER_SOLAR,
+    ",": _BANNER_AMBER,
+    "W": _BANNER_WHITE,
+    "Y": _BANNER_GOLD,
+    "C": _BANNER_COFFEE,
+    "B": _BANNER_SHADOW,
+}
+
+
+def _rgb_fg(rgb: tuple[int, int, int]) -> str:
+    r, g, b = rgb
+    return f"\x1b[38;2;{r};{g};{b}m"
+
+
+def _rgb_bg(rgb: tuple[int, int, int]) -> str:
+    r, g, b = rgb
+    return f"\x1b[48;2;{r};{g};{b}m"
+
+
+def _half_block_lines(pixels: list[str], legend: dict[str, tuple[int, int, int]]) -> list[str]:
+    """Cada 2 linhas de pixels viram 1 linha de terminal: `▀` com cor de
+    frente = pixel de cima e cor de fundo = pixel de baixo (técnica de
+    half-blocks). Quando só um dos dois pixels existe, usa `▀`/`▄` sem cor
+    de fundo, para não pintar um retângulo sólido onde deveria haver
+    transparência (fundo do terminal)."""
+    lines: list[str] = []
+    reset = _COLORS["reset"]
+    for i in range(0, len(pixels), 2):
+        top, bottom = pixels[i], pixels[i + 1]
+        parts: list[str] = []
+        for col in range(len(top)):
+            top_rgb = legend.get(top[col])
+            bottom_rgb = legend.get(bottom[col])
+            if top_rgb and bottom_rgb:
+                parts.append(f"{_rgb_fg(top_rgb)}{_rgb_bg(bottom_rgb)}▀{reset}")
+            elif top_rgb:
+                parts.append(f"{_rgb_fg(top_rgb)}▀{reset}")
+            elif bottom_rgb:
+                parts.append(f"{_rgb_fg(bottom_rgb)}▄{reset}")
+            else:
+                parts.append(" ")
+        lines.append("".join(parts))
+    return lines
+
+
+def _pad_visible(text: str, width: int) -> str:
+    return text + " " * max(0, width - _visible_len(text))
+
+
+def _center_visible(text: str, width: int) -> str:
+    gap = max(0, width - _visible_len(text))
+    left = gap // 2
+    return " " * left + text + " " * (gap - left)
+
+
+def _banner_border(text: str) -> str:
+    return f"{_rgb_fg(_BANNER_ORANGE)}{text}{_COLORS['reset']}"
+
+
+def _plain_banner() -> None:
+    """Sem cor (mas ainda em modo rico): mantém a arte antiga em texto puro
+    — half-blocks coloridos não fazem sentido sem TrueColor."""
     for line in _ART:
         print(line)
     print()
     print("  Uai, bamo trabalhar?")
     print()
+
+
+def _rich_banner(*, engine: str, model: str, user_email: str, version: str) -> None:
+    inner_width = _BANNER_WIDTH - 2  # entre as bordas │ │
+    margin = 1
+    content_width = inner_width - 2 * margin
+    left_width = _CUP_W + 3  # arte + respiro até a coluna da direita
+    right_width = content_width - left_width
+
+    # topo: ╭─ BAMO – AGENT ───...───╮
+    title = f"{_COLORS['bold']}{_rgb_fg(_BANNER_ORANGE)}{_BANNER_TITLE}{_COLORS['reset']}"
+    prefix = "╭─ "
+    suffix = " "
+    dashes = _BANNER_WIDTH - len(prefix) - _visible_len(_BANNER_TITLE) - len(suffix) - 1
+    print(_banner_border(prefix) + title + _banner_border(suffix + "─" * max(0, dashes) + "╮"))
+
+    cup_lines = _half_block_lines(_CUP_PIXELS, _CUP_LEGEND)
+    version_line = _center_visible(f"{_rgb_fg(_BANNER_MUTED)}Versão {version}{_COLORS['reset']}", _CUP_W)
+    left_lines = cup_lines + [version_line]
+
+    label_value = [
+        ("Motor", engine),
+        ("Modelo", model),
+        ("Usuário", user_email),
+    ]
+    label_width = max(len(label) for label, _ in label_value) + 1
+    meta_lines = [
+        f"{_rgb_fg(_BANNER_SOLAR)}{label.ljust(label_width)}:{_COLORS['reset']} {_rgb_fg(_BANNER_CREME)}{value}{_COLORS['reset']}"
+        for label, value in label_value
+    ]
+    top_pad = max(0, (len(left_lines) - len(meta_lines)) // 2)
+    right_lines = [""] * top_pad + meta_lines
+    right_lines += [""] * (len(left_lines) - len(right_lines))
+
+    for left_text, right_text in zip(left_lines, right_lines):
+        row = " " * margin + _pad_visible(left_text, left_width) + _pad_visible(right_text, right_width) + " " * margin
+        print(_banner_border("│") + row + _banner_border("│"))
+
+    print(_banner_border("╰" + "─" * (_BANNER_WIDTH - 2) + "╯"))
+
+
+# --- identidade e mensagens ----------------------------------------------
+
+
+def banner(
+    *,
+    engine: str = "Antigravity",
+    model: str = "Gemini 3.1 Pro",
+    user_email: str = "wallacyfrancis07@gmail.com",
+    version: str = "1.0.0",
+) -> None:
+    if not should_render_rich():
+        return
+    if not _color_enabled():
+        _plain_banner()
+        return
+    _rich_banner(engine=engine, model=model, user_email=user_email, version=version)
 
 
 def session_header() -> None:
